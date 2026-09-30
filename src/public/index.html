@@ -58,10 +58,21 @@
       <option value="equivalent">tau 自环 + 重命名（应等价）</option>
       <option value="missing">缺失匹配动作（应不等价）</option>
       <option value="cascade">多轮级联淘汰（初始对第 2 轮失败）</option>
+      <option value="oneway">单向包含边界（A⊑B 成立、B⊑A 不成立）</option>
     </select>
     <button class="ghost" id="loadBtn">载入</button>
     <span style="flex:1"></span>
     <button id="submitBtn">提交审计</button>
+  </div>
+
+  <div class="row">
+    <label style="margin:0">单向轨迹包含检查（普通复核后可选，不改变弱互模拟结论）：</label>
+    <select id="traceDir">
+      <option value="A">A ⊑ B：A 的全部可观察轨迹由 B 承接</option>
+      <option value="B">B ⊑ A：B 的全部可观察轨迹由 A 承接</option>
+    </select>
+    <button class="ghost" id="traceBtn">检查该方向</button>
+    <span class="muted">切换方向、编辑规程或载入示例会清除当前轨迹检查结果。</span>
   </div>
 
   <div class="grid">
@@ -76,6 +87,7 @@
   </div>
 
   <div id="result"></div>
+  <div id="traceResult" style="margin-top:18px"></div>
 </main>
 
 <script>
@@ -90,8 +102,17 @@ $('loadBtn').onclick = async () => {
   const s = all[key];
   $('inputA').value = fmt(s.procA, null, 2);
   $('inputB').value = fmt(s.procB, null, 2);
+  clearTrace();
   $('result').innerHTML = '<div class="verdict none">已载入示例：' + s.label + '，请提交审计。</div>';
 };
+
+// 切换方向、编辑规程或载入示例时清除轨迹检查结果
+function clearTrace() {
+  $('traceResult').innerHTML = '';
+}
+$('traceDir').onchange = clearTrace;
+$('inputA').addEventListener('input', clearTrace);
+$('inputB').addEventListener('input', clearTrace);
 
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -102,13 +123,79 @@ $('submitBtn').onclick = async () => {
   const parseErrors = [];
   try { procA = JSON.parse($('inputA').value); } catch (e) { parseErrors.push({ side: 'A', message: '规程 A 不是合法 JSON：' + e.message }); }
   try { procB = JSON.parse($('inputB').value); } catch (e) { parseErrors.push({ side: 'B', message: '规程 B 不是合法 JSON：' + e.message }); }
-  if (parseErrors.length) { render({ ok: false, equivalent: null, errors: parseErrors, rounds: [], eliminatedPairs: [], firstEliminated: null, initialPairs: [] }); return; }
+  if (parseErrors.length) { clearTrace(); render({ ok: false, equivalent: null, errors: parseErrors, rounds: [], eliminatedPairs: [], firstEliminated: null, initialPairs: [] }); return; }
   const res = await fetch('/api/audit', {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ procA, procB }),
   });
-  render(await res.json());
+  const j = await res.json();
+  if (j.ok === false || (j.errors && j.errors.length)) clearTrace(); // 校验失败清除轨迹检查结果
+  render(j);
 };
+
+$('traceBtn').onclick = async () => {
+  let procA, procB;
+  const parseErrors = [];
+  try { procA = JSON.parse($('inputA').value); } catch (e) { parseErrors.push({ side: 'A', message: '规程 A 不是合法 JSON：' + e.message }); }
+  try { procB = JSON.parse($('inputB').value); } catch (e) { parseErrors.push({ side: 'B', message: '规程 B 不是合法 JSON：' + e.message }); }
+  if (parseErrors.length) {
+    $('traceResult').innerHTML = renderErrors(parseErrors);
+    return;
+  }
+  const direction = $('traceDir').value;
+  const res = await fetch('/api/audit', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ procA, procB, traceDirection: direction }),
+  });
+  const j = await res.json();
+  if (j.ok === false || (j.errors && j.errors.length)) {
+    // 输入校验失败：清除轨迹检查结果并一次显示全部问题
+    $('traceResult').innerHTML = renderErrors(j.errors || []);
+    return;
+  }
+  renderTrace(j.traceInclusion);
+};
+
+function renderTrace(t) {
+  if (!t) {
+    $('traceResult').innerHTML = '<div class="verdict none">未执行轨迹包含检查。</div>';
+    return;
+  }
+  const dir = `<span class="tag ${t.leftSide === 'A' ? 'a' : 'b'}">左侧 ${esc(t.leftSide)}</span>
+    的全部可观察轨迹能否由 <span class="tag ${t.rightSide === 'A' ? 'a' : 'b'}">右侧 ${esc(t.rightSide)}</span> 承接`;
+  if (t.included) {
+    $('traceResult').innerHTML = `<h3>单向轨迹包含检查（${dir}）</h3>
+      <div class="verdict eq">✓ 包含成立：左侧的每条可观察轨迹都能被右侧以“静默前缀后承接同动作”承接。
+      <small>搜索前沿按左侧位置分桶并做包含剪枝，共接纳 ${t.frontierEntries} 个不可互相替代的右侧状态集合（展开 ${t.exploredEntries} 个节点）。此结果不改变上方弱互模拟结论。</small></div>`;
+    return;
+  }
+  const rows = t.rounds.map((rd) => {
+    const before = rd.rightBefore.map((s) => `<span class="tag">${esc(s)}</span>`).join(' ') || '∅';
+    const lt = rd.leftTargets.map((s) => esc(s)).join(', ');
+    const rr = rd.rightResponses.length
+      ? rd.rightResponses.map((s) => `<span class="tag">${esc(s)}</span>`).join(' ')
+      : '<b style="color:#f0a2ab">∅ 首个空响应</b>';
+    const next = rd.firstEmpty ? '—' : `<span class="mono">${esc(rd.nextLeft)}</span>；右侧集合：${rd.nextRight.map((s) => `<span class="tag">${esc(s)}</span>`).join(' ')}`;
+    return `<tr${rd.firstEmpty ? ' style="background:#3a1419"' : ''}>
+      <td>第 ${rd.step} 轮</td>
+      <td><code>${esc(rd.action)}</code></td>
+      <td class="mono">${esc(rd.leftPosition)}<div class="muted">静默可达：${rd.leftClosure.map(esc).join(', ')}</div></td>
+      <td>${before}</td>
+      <td class="mono">${lt}</td>
+      <td>${rr}</td>
+      <td>${next}</td>
+    </tr>`;
+  }).join('');
+  $('traceResult').innerHTML = `<h3>单向轨迹包含检查（${dir}）</h3>
+    <div class="verdict ne">✗ 包含不成立：最短反例轨迹 <code>${t.trace.map(esc).join(' · ') || 'ε'}</code>
+      <small>这是长度最短、且同长度下按动作 ASCII 序最小的反例。最后一轮左侧可发起该动作，而右侧在已读动作前可能停留的状态集合对其给出<b>首个空响应</b>。此结果不改变上方弱互模拟结论。</small></div>
+    <div class="card" style="margin-top:8px"><div class="scroll"><table>
+      <tr><th>轮次</th><th>动作</th><th>左侧位置</th><th>右侧已读动作前集合</th><th>左侧迁移落点</th><th>右侧可响应集合</th><th>推进后（左侧位置 / 右侧集合）</th></tr>
+      ${rows}
+    </table></div>
+    <div class="muted" style="margin-top:8px">前沿剪枝：共接纳 ${t.frontierEntries} 个不可互相替代集合（展开 ${t.exploredEntries} 个节点）；右侧集合每轮均沿稳定前驱链由响应落点重新展开静默前缀复算。</div>
+    </div>`;
+}
 
 function render(r) {
   const root = $('result');
