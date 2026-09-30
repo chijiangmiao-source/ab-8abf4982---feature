@@ -54,10 +54,12 @@ const server = http.createServer(async (req, res) => {
       const raw = await readBody(req);
       payload = JSON.parse(raw);
     } catch (e) {
-      sendJson(res, 400, { ok: false, equivalent: null, errors: [{ code: 'BAD_JSON', field: 'body', side: null, message: '请求体不是合法 JSON' }], rounds: [], eliminatedPairs: [], firstEliminated: null, initialPairs: [] });
+      sendJson(res, 400, { ok: false, equivalent: null, errors: [{ code: 'BAD_JSON', field: 'body', side: null, message: '请求体不是合法 JSON' }], rounds: [], eliminatedPairs: [], firstEliminated: null, initialPairs: [], traceChecks: [] });
       return;
     }
-    const result = audit(payload.procA, payload.procB);
+    const options = {};
+    if (Array.isArray(payload.directions)) options.directions = payload.directions;
+    const result = audit(payload.procA, payload.procB, options);
     // 输入无效时同样以 200 返回结构化问题集合（结论字段为空，表示已清除旧结论）；
     // 仅结构错误（非 JSON）才返回 400。
     sendJson(res, 200, result);

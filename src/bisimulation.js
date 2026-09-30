@@ -11,6 +11,7 @@ const TAU = 'tau';
 const MAX_STATES = 18;
 const MAX_VISIBLE_ACTIONS = 4;
 const TOKEN_RE = /^[!-~]+$/; // 非空白可见 ASCII
+const DIRECTIONS = ['A-to-B', 'B-to-A']; // 可选的方向性轨迹承接检查
 
 // ---------- 校验：一次收集全部问题 ----------
 
@@ -134,6 +135,324 @@ function weakTargets(proc, src, action) {
   return result;
 }
 
+// ---------- 方向性轨迹承接检查 ----------
+//
+// 工程师完成普通复核后可选一个方向：检查攻方（左侧）所有可观察动作轨迹
+// 是否均能由守方（右侧）承接，而不改变原有弱互模拟结论（普通审计照常输出）。
+//
+// 引擎沿左侧的一条存在性路径推进（左侧当前位置为单个状态；同一动作有多个落点
+// 时分别分支），同时把“右侧在已读动作前仍可能停留的状态集合”做全集子集构造：
+//   - 静默前缀仍按既有语义展开：动作前可经任意条 tau；动作后不吸收尾部 tau；
+//   - 一旦守方集合对下一动作无任何静默前缀后的同动作响应（空响应），
+//     而左侧存在该弱迁移，即得到反例轨迹。
+//
+// 反例按长度最短、同长度按动作 ASCII 序最小选取（分层 BFS，动作按 ASCII 序展开）。
+//
+// 为避免十八状态规程的子集搜索失控：守方集合以 18 位位集表示，并按动作预计算
+// 各子集的静默前缀并集、可承接状态与响应落点子集表（子集 DP，每步 O(1)）；
+// 再按左侧位置维护不可互相替代的守方状态集合（前沿）：集合间有严格包含关系时，
+// 更小的集合能导致更强失败结论（可响应集合对起始集合单调），仅在其前驱动作序列
+// 不更大时剪枝以保 ASCII 最小性。每一步以稳定前驱链复算左侧迁移与右侧可响应集合。
+
+// 动作序列字典序（动作均为可见 ASCII token，按 ASCII 码序比较）
+function cmpWord(a, b) {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    if (a[i] < b[i]) return -1;
+    if (a[i] > b[i]) return 1;
+  }
+  return a.length - b.length;
+}
+
+// 位集按状态索引（names 已排序）展开为名称数组，天然有序
+function namesOf(mask, names) {
+  const out = [];
+  let m = mask;
+  while (m) {
+    const b = m & -m;
+    out.push(names[31 - Math.clz32(b)]);
+    m ^= b;
+  }
+  return out;
+}
+
+// 守方位集表：闭包并集、每动作的可承接状态并集、响应落点并集。
+// 全量分配 2^n 位集数组（零填充分配廉价），但按探索到的子集惰性填充（子集 DP）。
+function buildResponderTables(R, actions) {
+  const n = R.names.length;
+  const idx = new Map(R.names.map((name, i) => [name, i]));
+  const closure = new Uint32Array(n);
+  for (let i = 0; i < n; i++) for (const s of epsilonClosure(R, R.names[i])) closure[i] |= 1 << idx.get(s);
+
+  const size = 1 << n;
+  const closureUnion = new Uint32Array(size);
+  const enUnion = new Map();
+  const tgtUnion = new Map();
+  for (const a of actions) {
+    enUnion.set(a, new Uint32Array(size));
+    tgtUnion.set(a, new Uint32Array(size));
+  }
+  const singleEn = new Map();
+  const singleTgt = new Map();
+  for (const a of actions) {
+    singleEn.set(a, new Uint32Array(n));
+    singleTgt.set(a, new Uint32Array(n));
+  }
+  for (let i = 0; i < n; i++) {
+    for (const a of actions) {
+      let en = 0;
+      let tgt = 0;
+      let cm = closure[i];
+      while (cm) {
+        const b = cm & -cm;
+        const u = 31 - Math.clz32(b);
+        const ts = R.out.get(R.names[u]).get(a);
+        if (ts) {
+          en |= b;
+          for (const p of ts) tgt |= 1 << idx.get(p);
+        }
+        cm ^= b;
+      }
+      singleEn.get(a)[i] = en;
+      singleTgt.get(a)[i] = tgt;
+    }
+  }
+  // 惰性 DP：闭包并集对非空子集必非 0，可作为“已计算”标记
+  const ensure = (m) => {
+    if (m && !closureUnion[m]) {
+      const b = m & -m;
+      const i = 31 - Math.clz32(b);
+      const rest = m ^ b;
+      ensure(rest);
+      closureUnion[m] = closure[i] | closureUnion[rest];
+      for (const a of actions) {
+        enUnion.get(a)[m] = singleEn.get(a)[i] | enUnion.get(a)[rest];
+        tgtUnion.get(a)[m] = singleTgt.get(a)[i] | tgtUnion.get(a)[rest];
+      }
+    }
+  };
+  return { n, idx, closureUnion, enUnion, tgtUnion, ensure };
+}
+
+// 左侧位集表：每个状态对每动作的可发起源状态与落点（已含静默前缀）
+function buildLeftTables(L, actions) {
+  const n = L.names.length;
+  const idx = new Map(L.names.map((name, i) => [name, i]));
+  const src = new Map();
+  const tgt = new Map();
+  for (const a of actions) {
+    src.set(a, new Uint32Array(n));
+    tgt.set(a, new Uint32Array(n));
+  }
+  for (let i = 0; i < n; i++) {
+    const closure = [...epsilonClosure(L, L.names[i])].map((s) => idx.get(s));
+    for (const a of actions) {
+      let sm = 0;
+      let tm = 0;
+      for (const u of closure) {
+        const ts = L.out.get(L.names[u]).get(a);
+        if (ts) {
+          sm |= 1 << u;
+          for (const p of ts) tm |= 1 << idx.get(p);
+        }
+      }
+      src.get(a)[i] = sm;
+      tgt.get(a)[i] = tm;
+    }
+  }
+  return { n, idx, src, tgt };
+}
+
+function traceCheck(specL, specR, L, R, direction) {
+  const actions = [...L.actions].filter((a) => a !== TAU).sort(); // 仅左侧可观察动作，ASCII 序
+  const tabs = buildResponderTables(R, actions);
+  const ltabs = buildLeftTables(L, actions);
+  const lInit = ltabs.idx.get(specL.initial);
+  const rInit = tabs.idx.get(specR.initial);
+  const configKey = (left, setMask) => setMask * tabs.n + left; // 同一 (左侧位置, 守方集合) 配置
+
+  let frontier = []; // 当前层节点：{ left, set, prev, action, step, word }
+  const seen = new Map(); // configKey -> 到达该配置的最短动作序列
+  let frontierPeak = 0;
+
+  const root = { left: lInit, set: 1 << rInit, prev: null, action: null, step: 0, word: [] };
+  seen.set(configKey(root.left, root.set), root.word);
+  frontier.push(root);
+
+  while (frontier.length) {
+    frontierPeak = Math.max(frontierPeak, frontier.length);
+    // 词优先的分层 BFS：同一动作序列可对应左侧不同分支配置，故按动作序列分组，
+    // 序列按 ASCII 序处理；对每个序列再按动作 ASCII 序，只要该序列下任一配置
+    // 出现“左侧能走而右侧空响应”，该序列即为反例（首个即最短/ASCII 最小）。
+    frontier.sort((x, y) => cmpWord(x.word, y.word) || x.left - y.left);
+    const groups = []; // [{ word, nodes }]
+    for (const n of frontier) {
+      const g = groups.length && cmpWord(groups[groups.length - 1].word, n.word) === 0
+        ? groups[groups.length - 1]
+        : (groups.push({ word: n.word, nodes: [] }), groups[groups.length - 1]);
+      g.nodes.push(n);
+    }
+
+    const next = [];
+    const layerIndex = new Map(); // 本层 configKey -> 在 next 中的位置，同配置只留最小序列
+
+    for (const g of groups) {
+      for (const action of actions) {
+        // 先求该序列下每个配置的左侧落点与右侧可响应集合
+        const steps = [];
+        for (const node of g.nodes) {
+          const leftTgtMask = ltabs.tgt.get(action)[node.left];
+          if (!leftTgtMask) continue; // 该分支在此动作不可走，不构成挑战
+          tabs.ensure(node.set);
+          steps.push({ node, leftTgtMask, targetsMask: tabs.tgtUnion.get(action)[node.set] });
+        }
+        if (!steps.length) continue;
+
+        // 该动作序列下若任一配置空响应，则 [word·action] 即反例；
+        // 多个分支空响应时取左侧位置最小者，保证首个空响应稳定可复现
+        const fail = steps.filter((x) => !x.targetsMask).sort((x, y) => x.node.left - y.node.left)[0];
+        if (fail) {
+          const node = fail.node;
+          const leaf = { left: node.left, set: node.set, prev: node, action, step: node.step + 1, word: [...node.word, action] };
+          return buildTraceResult(direction, leaf, L, R, ltabs, tabs, frontierPeak);
+        }
+
+        // 全部配置都已承接：左侧每个落点分别分支（存在性路径），右侧承接为全集子集
+        const word = [...g.word, action];
+        for (const { node, leftTgtMask, targetsMask } of steps) {
+          let tm = leftTgtMask;
+          while (tm) {
+            const b = tm & -tm;
+            const t = 31 - Math.clz32(b);
+            const key = configKey(t, targetsMask);
+            const li = layerIndex.get(key);
+            if (li !== undefined) {
+              if (cmpWord(word, next[li].word) < 0) {
+                seen.set(key, word);
+                next[li] = { left: t, set: targetsMask, prev: node, action, step: node.step + 1, word };
+              }
+            } else if (!seen.has(key)) {
+              seen.set(key, word);
+              layerIndex.set(key, next.length);
+              next.push({ left: t, set: targetsMask, prev: node, action, step: node.step + 1, word });
+            }
+            tm ^= b;
+          }
+        }
+      }
+    }
+
+    frontier = pruneFrontier(next);
+  }
+
+  return {
+    direction,
+    leftSide: direction === 'A-to-B' ? 'A' : 'B',
+    rightSide: direction === 'A-to-B' ? 'B' : 'A',
+    contained: true,
+    trace: null,
+    length: 0,
+    rounds: [],
+    firstEmptyResponse: null,
+    frontierPeak,
+  };
+}
+
+// 按左侧位置维护前沿：同一左侧位置下，守方集合有严格包含关系时，更小的集合
+// 可响应能力更弱、能导致更强失败结论（可响应对起始集合单调），删除被其包含的
+// 更大集合；仅当更强集合的前驱动作序列不更大时才剪枝，保证反例仍为 ASCII 最小。
+function pruneFrontier(nodes) {
+  const byLeft = new Map();
+  for (const n of nodes) {
+    if (!byLeft.has(n.left)) byLeft.set(n.left, []);
+    byLeft.get(n.left).push(n);
+  }
+  const kept = [];
+  for (const group of byLeft.values()) {
+    // 集合大小升序：更可能成为“更强失败”的小集合先作为支配者
+    const ordered = [...group].sort((x, y) => popcount(x.set) - popcount(y.set));
+    for (let i = 0; i < ordered.length; i++) {
+      const n = ordered[i];
+      let dominated = false;
+      for (let j = 0; j < i; j++) { // 仅严格更小（j 在前）的集合可能支配 n
+        const m = ordered[j];
+        if (cmpWord(m.word, n.word) <= 0 && (m.set | n.set) === n.set) {
+          dominated = true; // m 的集合严格更小（更强失败）且前驱序列不更大
+          break;
+        }
+      }
+      if (!dominated) kept.push(n);
+    }
+  }
+  return kept;
+}
+
+function popcount(m) {
+  m = m - ((m >>> 1) & 0x55555555);
+  m = (m & 0x33333333) + ((m >>> 2) & 0x33333333);
+  return (((m + (m >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
+}
+
+function buildRound(action, index, preLeft, preSet, postSetMask, L, R, ltabs, tabs, isFail) {
+  tabs.ensure(preSet);
+  const leftSrcMask = ltabs.src.get(action)[preLeft];
+  const leftTgtMask = ltabs.tgt.get(action)[preLeft];
+  const beforeMask = tabs.closureUnion[preSet];
+  const enabledMask = tabs.enUnion.get(action)[preSet];
+  const round = {
+    index,
+    action,
+    leftState: L.names[preLeft],
+    rightSet: namesOf(preSet, R.names),
+    rightBeforeSet: namesOf(beforeMask, R.names),
+    leftSources: namesOf(leftSrcMask, L.names),
+    leftTargets: namesOf(leftTgtMask, L.names),
+    responderEnabled: namesOf(enabledMask, R.names),
+    responderTargets: namesOf(postSetMask, R.names),
+    emptyResponse: null,
+  };
+  if (isFail) {
+    round.emptyResponse = {
+      leftState: L.names[preLeft],
+      action,
+      rightSet: namesOf(preSet, R.names),
+      rightBeforeSet: namesOf(beforeMask, R.names),
+      responderEnabled: [],
+      responderTargets: [],
+    };
+  }
+  return round;
+}
+
+// 沿稳定前驱链由位集表复算每一轮的动作、左侧位置、右侧集合与首个空响应
+function buildTraceResult(direction, leaf, L, R, ltabs, tabs, frontierPeak) {
+  const succ = []; // 成功承接的步节点（leaf.prev 向上至第 1 步）
+  for (let n = leaf.prev; n && n.prev; n = n.prev) succ.push(n);
+  succ.reverse();
+
+  const rounds = [];
+  const trace = [];
+  succ.forEach((n, i) => {
+    rounds.push(buildRound(n.action, i + 1, n.prev.left, n.prev.set, n.set, L, R, ltabs, tabs, false));
+    trace.push(n.action);
+  });
+  // 末轮：守方集合首个空响应
+  rounds.push(buildRound(leaf.action, leaf.step, leaf.left, leaf.set, 0, L, R, ltabs, tabs, true));
+  trace.push(leaf.action);
+
+  return {
+    direction,
+    leftSide: direction === 'A-to-B' ? 'A' : 'B',
+    rightSide: direction === 'A-to-B' ? 'B' : 'A',
+    contained: false,
+    trace,
+    length: trace.length,
+    rounds,
+    firstEmptyResponse: rounds[rounds.length - 1].emptyResponse,
+    frontierPeak,
+  };
+}
+
 // ---------- 按轮次淘汰 ----------
 //
 // R_0 为全部跨侧状态对；第 k 轮用上一轮存活集 R_{k-1} 检查每个存活对的
@@ -168,11 +487,14 @@ function sortedActions(A, B) {
   });
 }
 
-function audit(specA, specB) {
+function audit(specA, specB, opts = {}) {
+  const wantDirs = Array.isArray(opts.directions)
+    ? [...new Set(opts.directions)].filter((d) => DIRECTIONS.includes(d))
+    : [];
   const errors = [...validateSpec(specA, 'A'), ...validateSpec(specB, 'B')];
   if (errors.length) {
-    // 输入无效：一次显示所有问题并清除旧结论（无等价判定、无轮次）
-    return { ok: false, equivalent: null, errors, rounds: [], eliminatedPairs: [], firstEliminated: null, initialPairs: [] };
+    // 输入无效：一次显示所有问题并清除旧结论（无等价判定、无轮次、无方向性反例）
+    return { ok: false, equivalent: null, errors, rounds: [], eliminatedPairs: [], firstEliminated: null, initialPairs: [], traceChecks: [] };
   }
 
   const A = normalize(specA);
@@ -288,6 +610,13 @@ function audit(specA, specB) {
     ...canonicalRelation.map(([a, b]) => [b, a]),
   ].sort((p, q) => (p[0] < q[0] ? -1 : p[0] > q[0] ? 1 : p[1] < q[1] ? -1 : p[1] > q[1] ? 1 : 0));
 
+  // 可选的方向性轨迹承接检查：不改变弱互模拟结论，普通审计字段照常输出
+  const traceChecks = wantDirs.map((dir) =>
+    (dir === 'A-to-B')
+      ? traceCheck(specA, specB, A, B, dir)
+      : traceCheck(specB, specA, B, A, dir),
+  );
+
   return {
     ok: true,
     equivalent,
@@ -301,6 +630,7 @@ function audit(specA, specB) {
       [specB.initial, specA.initial],
     ],
     initialAlive: [initSurvives, initSurvives],
+    traceChecks,
   };
 }
 
@@ -308,9 +638,11 @@ module.exports = {
   TAU,
   MAX_STATES,
   MAX_VISIBLE_ACTIONS,
+  DIRECTIONS,
   validateSpec,
   normalize,
   epsilonClosure,
   weakTargets,
+  traceCheck,
   audit,
 };

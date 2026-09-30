@@ -58,9 +58,17 @@
       <option value="equivalent">tau 自环 + 重命名（应等价）</option>
       <option value="missing">缺失匹配动作（应不等价）</option>
       <option value="cascade">多轮级联淘汰（初始对第 2 轮失败）</option>
+      <option value="oneway">单向包含边界（A→B 承接，B→A 反例 [y]）</option>
     </select>
     <button class="ghost" id="loadBtn">载入</button>
     <span style="flex:1"></span>
+    <label style="margin:0">方向性轨迹承接（可选）：</label>
+    <select id="direction" title="普通复核完成后，可选一个方向检查左侧所有可观察动作轨迹是否均能由右侧承接">
+      <option value="">不检查</option>
+      <option value="A-to-B">左侧 A 的轨迹由 B 承接（A → B）</option>
+      <option value="B-to-A">左侧 B 的轨迹由 A 承接（B → A）</option>
+      <option value="both">双向各检查一次</option>
+    </select>
     <button id="submitBtn">提交审计</button>
   </div>
 
@@ -90,8 +98,20 @@ $('loadBtn').onclick = async () => {
   const s = all[key];
   $('inputA').value = fmt(s.procA, null, 2);
   $('inputB').value = fmt(s.procB, null, 2);
+  // 载入示例：清除方向性轨迹承接结果（普通结论同样待重新提交）
+  clearTrace();
   $('result').innerHTML = '<div class="verdict none">已载入示例：' + s.label + '，请提交审计。</div>';
 };
+
+// 切换方向或编辑规程时，旧的方向性反例立即失效并清除
+$('direction').addEventListener('change', clearTrace);
+$('inputA').addEventListener('input', clearTrace);
+$('inputB').addEventListener('input', clearTrace);
+
+function clearTrace() {
+  const el = $('traceResult');
+  if (el) el.remove();
+}
 
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -103,9 +123,13 @@ $('submitBtn').onclick = async () => {
   try { procA = JSON.parse($('inputA').value); } catch (e) { parseErrors.push({ side: 'A', message: '规程 A 不是合法 JSON：' + e.message }); }
   try { procB = JSON.parse($('inputB').value); } catch (e) { parseErrors.push({ side: 'B', message: '规程 B 不是合法 JSON：' + e.message }); }
   if (parseErrors.length) { render({ ok: false, equivalent: null, errors: parseErrors, rounds: [], eliminatedPairs: [], firstEliminated: null, initialPairs: [] }); return; }
+  const dir = $('direction').value;
+  const body = { procA, procB };
+  if (dir === 'both') body.directions = ['A-to-B', 'B-to-A'];
+  else if (dir) body.directions = [dir];
   const res = await fetch('/api/audit', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ procA, procB }),
+    body: JSON.stringify(body),
   });
   render(await res.json());
 };
@@ -113,10 +137,11 @@ $('submitBtn').onclick = async () => {
 function render(r) {
   const root = $('result');
   if (r.ok === false || (r.errors && r.errors.length)) {
+    // 输入校验失败：清除方向性反例结果
     root.innerHTML = renderErrors(r.errors || []);
     return;
   }
-  root.innerHTML = renderVerdict(r) + renderInitialPairs(r) + renderFirst(r) + renderRounds(r) + renderRelation(r) + renderEliminated(r);
+  root.innerHTML = renderVerdict(r) + renderInitialPairs(r) + renderTrace(r) + renderFirst(r) + renderRounds(r) + renderRelation(r) + renderEliminated(r);
 }
 
 function renderErrors(errors) {
@@ -141,6 +166,47 @@ function renderInitialPairs(r) {
     return `<tr><td class="mono">(${esc(p[0])}, ${esc(p[1])})</td><td>${alive ? '<span style="color:#88e0a0">在最终关系中</span>' : '<span style="color:#f0a2ab">已淘汰</span>'}</td></tr>`;
   }).join('');
   return `<h3>关系中的初始状态对（两个方向）</h3><div class="card"><table><tr><th>初始状态对</th><th>结果</th></tr>${rows}</table></div>`;
+}
+
+function setList(arr) {
+  return arr && arr.length ? arr.map((s) => `<span class="tag">${esc(s)}</span>`).join(' ') : '<span class="muted">∅（空集）</span>';
+}
+
+function renderTrace(r) {
+  const checks = r.traceChecks || [];
+  if (!checks.length) return '';
+  const blocks = checks.map((t) => {
+    const head = t.contained
+      ? `<div class="verdict eq" style="margin:0">✓ 方向 ${esc(t.leftSide)} → ${esc(t.rightSide)}：左侧全部可观察动作轨迹均可由右侧承接（含静默前缀），未发现反例。
+          <small>静默环仅在动作前按既有语义展开；该方向性检查不改变上方弱互模拟结论。</small></div>`
+      : `<div class="verdict ne" style="margin:0">✗ 方向 ${esc(t.leftSide)} → ${esc(t.rightSide)}：存在右侧无法承接的轨迹。
+          <small>长度最短、同长度按动作 ASCII 序最小的反例：<b class="mono">${t.trace.map((a) => esc(a)).join(' · ')}</b>（长度 ${t.length}）</small></div>`;
+    if (t.contained) return `<div class="card" style="margin-top:12px">${head}</div>`;
+    const roundRows = t.rounds.map((rd) => {
+      const empty = rd.emptyResponse
+        ? `<div style="color:#f0a2ab;margin-top:6px">⚠ 首个空响应：左侧在 <b class="mono">${esc(rd.leftState)}</b> 发起 <code>${esc(rd.action)}</code> 时，右侧停留集合 ${setList(rd.rightSet)}（静默前缀后 ${setList(rd.rightBeforeSet)}）无任何同动作响应落点。</div>`
+        : '';
+      return `<tr>
+        <td>${rd.index}</td>
+        <td><code>${esc(rd.action)}</code></td>
+        <td class="mono">${esc(rd.leftState)}</td>
+        <td>${setList(rd.rightSet)}</td>
+        <td>${setList(rd.rightBeforeSet)}</td>
+        <td>${setList(rd.responderEnabled)}</td>
+        <td>${setList(rd.responderTargets)}</td>
+        <td>${empty || '<span class="muted">已承接</span>'}</td>
+      </tr>`;
+    }).join('');
+    return `<div class="card" style="margin-top:12px">
+      ${head}
+      <div style="margin:10px 0 6px">反例轨迹（每轮动作、左侧位置、右侧集合与首个空响应）：</div>
+      <div class="scroll"><table>
+        <tr><th>轮次</th><th>动作</th><th>左侧位置</th><th>右侧已读动作前停留集合</th><th>静默前缀展开后</th><th>可承接状态</th><th>右侧可响应落点</th><th>空响应</th></tr>
+        ${roundRows}
+      </table></div>
+    </div>`;
+  }).join('');
+  return `<h3 style="margin-top:22px">方向性轨迹承接检查</h3><div id="traceResult">${blocks}</div>`;
 }
 
 function renderFirst(r) {

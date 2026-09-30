@@ -7,6 +7,8 @@
 //   3) 接口 / HTTP 冒烟：健康路径、页面、审计接口
 //      - 静默环等价规程：审计必须判定等价，关系含两个初始状态对
 //      - 缺失匹配动作规程：审计必须判定不等价，且失败依据只引用更早轮次
+//      - 方向性轨迹承接：静默环轨迹包含、缺失动作最短反例、双向结果不同边界、
+//        无效输入清除方向性结果
 //      - 无效输入：一次返回全部问题并清除旧结论
 // 完成后退出：全部通过 0，任一失败 1。
 
@@ -108,6 +110,7 @@ async function postAudit(body) {
     assert.match(res.headers.get('content-type') || '', /text\/html/);
     const html = await res.text();
     assert.ok(html.includes('弱互模拟审计'));
+    assert.ok(html.includes('方向性轨迹承接'), '页面应提供方向性轨迹承接入口');
   });
 
   await astep('示例接口 GET /api/samples 包含等价与缺失规程', async () => {
@@ -149,6 +152,52 @@ async function postAudit(body) {
         }
       }
     }
+  });
+
+  await astep('方向性检查：含静默环的轨迹双向均包含且不改变等价结论', async () => {
+    const j = await postAudit({ ...samples.equivalent, directions: ['A-to-B', 'B-to-A'] });
+    assert.equal(j.equivalent, true);
+    assert.equal(j.traceChecks.length, 2);
+    for (const t of j.traceChecks) {
+      assert.equal(t.contained, true);
+      assert.equal(t.trace, null);
+      assert.deepEqual(t.rounds, []);
+    }
+  });
+
+  await astep('方向性检查：缺失动作给出长度 1 的最短反例并展开空响应轮次', async () => {
+    const j = await postAudit({ ...samples.missing, directions: ['A-to-B', 'B-to-A'] });
+    const [ab, ba] = j.traceChecks;
+    assert.equal(ab.contained, false);
+    assert.deepEqual(ab.trace, ['x']);
+    assert.equal(ab.length, 1);
+    assert.equal(ab.rounds.length, 1);
+    assert.equal(ab.rounds[0].leftState, 'a0');
+    assert.deepEqual(ab.rounds[0].rightSet, ['b0']);
+    assert.deepEqual(ab.rounds[0].responderTargets, []);
+    assert.ok(ab.rounds[0].emptyResponse, '必须标注首个空响应');
+    assert.ok(ab.firstEmptyResponse);
+    assert.deepEqual(ba.trace, ['y']); // 反方向最短反例为 y
+  });
+
+  await astep('方向性检查：双向结果不同的边界（A→B 包含，B→A 反例 [y]）', async () => {
+    const j = await postAudit({ ...samples.oneway, directions: ['A-to-B', 'B-to-A'] });
+    assert.equal(j.equivalent, false, '弱互模拟结论不因方向检查改变');
+    assert.equal(j.traceChecks[0].contained, true);
+    assert.equal(j.traceChecks[1].contained, false);
+    assert.deepEqual(j.traceChecks[1].trace, ['y']);
+  });
+
+  await astep('方向性检查：无效输入时 traceChecks 为空并清除结论', async () => {
+    const bad = {
+      procA: { states: [{ name: 's' }, { name: 's' }], initial: 's', transitions: [] },
+      procB: { states: [{ name: 'q' }], initial: 'q', transitions: [] },
+      directions: ['A-to-B'],
+    };
+    const j = await postAudit(bad);
+    assert.equal(j.ok, false);
+    assert.equal(j.equivalent, null);
+    assert.deepEqual(j.traceChecks, []);
   });
 
   await astep('无效输入：一次返回全部问题并清除旧结论', async () => {
